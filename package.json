@@ -1,0 +1,23 @@
+{
+  "name": "remotenet-server",
+  "version": "1.0.0",
+  "description": "RemoteNet Socket.IO Relay Server",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "echo \"No tests specified\""
+  },
+  "keywords": [
+    "remotenet",
+    "socket.io",
+    "relay-server"
+  ],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "cors": "^2.8.6",
+    "express": "^4.22.3",
+    "socket.io": "^4.8.1"
+  }
+}
