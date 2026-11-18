@@ -4,6 +4,8 @@ const http = require("http");
 const cors = require("cors");
 const { Server } = require("socket.io");
 const admin = require("firebase-admin");
+console.log("[DEBUG] Firebase Admin exports:", Object.keys(admin));
+console.log("[DEBUG] credential:", admin.credential);
 
 // =====================================
 // FIREBASE ADMIN INITIALIZATION
