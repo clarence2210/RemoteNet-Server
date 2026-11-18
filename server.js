@@ -3,41 +3,53 @@ const express = require("express");
 const http = require("http");
 const cors = require("cors");
 const { Server } = require("socket.io");
-const admin = require("firebase-admin");
-console.log("[DEBUG] Firebase Admin exports:", Object.keys(admin));
-console.log("[DEBUG] credential:", admin.credential);
+
+// Firebase Admin SDK v14 modular imports
+const { initializeApp, cert } = require("firebase-admin/app");
+const { getAuth } = require("firebase-admin/auth");
+const { getDatabase } = require("firebase-admin/database");
 
 // =====================================
 // FIREBASE ADMIN INITIALIZATION
 // =====================================
 
 try {
+
     const encodedServiceAccount =
         process.env.FIREBASE_SERVICE_ACCOUNT_BASE64;
 
     if (!encodedServiceAccount) {
-        throw new Error("Firebase service account environment variable is missing");
+        throw new Error(
+            "Firebase service account environment variable is missing"
+        );
     }
 
     const serviceAccount = JSON.parse(
         Buffer.from(encodedServiceAccount, "base64").toString("utf8")
     );
 
-    admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount),
+    initializeApp({
+        credential: cert(serviceAccount),
         databaseURL:
             "https://remotenet-b4106-default-rtdb.asia-southeast1.firebasedatabase.app"
     });
 
-    console.log("[FIREBASE] Admin SDK initialized successfully");
+    console.log(
+        "[FIREBASE] Admin SDK initialized successfully"
+    );
 
 } catch (error) {
-    console.error("[FIREBASE] Initialization failed:", error.message);
+
+    console.error(
+        "[FIREBASE] Initialization failed:",
+        error.message
+    );
+
     process.exit(1);
 }
 
-const firebaseAuth = admin.auth();
-const firebaseDb = admin.database();
+const firebaseAuth = getAuth();
+const firebaseDb = getDatabase();
 
 // =====================================
 // SERVER SETUP
@@ -53,6 +65,7 @@ app.use(cors());
 app.use(express.json());
 
 const io = new Server(server, {
+
     cors: {
         origin: "*",
         methods: ["GET", "POST"]
@@ -71,23 +84,31 @@ const io = new Server(server, {
 // =====================================
 
 app.get("/", (req, res) => {
+
     res.status(200).json({
+
         app: "RemoteNet Relay Server",
         status: "ONLINE",
+
         hosting: process.env.RENDER
             ? "Render Cloud"
             : "Local Server",
+
         transport: "Socket.IO WebSocket",
         timestamp: new Date().toISOString()
+
     });
 });
 
 app.get("/health", (req, res) => {
+
     res.status(200).json({
+
         status: "ONLINE",
         connectedClients: io.engine.clientsCount,
         transport: "websocket",
         uptime: process.uptime()
+
     });
 });
 
@@ -103,13 +124,21 @@ io.use(async (socket, next) => {
             socket.handshake.headers.authorization || "";
 
         if (!authorization.startsWith("Bearer ")) {
-            return next(new Error("Authentication required"));
+
+            return next(
+                new Error("Authentication required")
+            );
         }
 
-        const idToken = authorization.substring(7).trim();
+        const idToken = authorization
+            .substring(7)
+            .trim();
 
         if (!idToken) {
-            return next(new Error("Authentication token missing"));
+
+            return next(
+                new Error("Authentication token missing")
+            );
         }
 
         // Verify Firebase ID token and check revocation.
@@ -119,19 +148,26 @@ io.use(async (socket, next) => {
         );
 
         if (!decodedToken.uid) {
-            return next(new Error("Invalid authentication identity"));
+
+            return next(
+                new Error("Invalid authentication identity")
+            );
         }
 
-        // Store verified identity on the socket.
+        // Store verified identity on socket.
         socket.data.uid = decodedToken.uid;
 
         next();
 
     } catch (error) {
 
-        console.warn("[AUTH] Socket authentication rejected");
+        console.warn(
+            "[AUTH] Socket authentication rejected"
+        );
 
-        next(new Error("Firebase authentication failed"));
+        next(
+            new Error("Firebase authentication failed")
+        );
     }
 });
 
@@ -141,7 +177,9 @@ io.use(async (socket, next) => {
 
 io.on("connection", (socket) => {
 
-    console.log("[CONNECT] Authenticated client connected");
+    console.log(
+        "[CONNECT] Authenticated client connected"
+    );
 
     // =================================
     // JOIN ROOM
@@ -151,7 +189,9 @@ io.on("connection", (socket) => {
 
         try {
 
-            const roomId = String(data?.roomId || "").trim();
+            const roomId = String(
+                data?.roomId || ""
+            ).trim();
 
             // Client-supplied role is deliberately ignored.
             const uid = socket.data.uid;
@@ -212,8 +252,11 @@ io.on("connection", (socket) => {
             let verifiedRole = null;
 
             if (uid === session.senderUid) {
+
                 verifiedRole = "sender";
+
             } else if (uid === session.receiverUid) {
+
                 verifiedRole = "receiver";
             }
 
@@ -227,7 +270,9 @@ io.on("connection", (socket) => {
             }
 
             // Check duplicate role BEFORE leaving previous room.
-            const members = await io.in(roomId).fetchSockets();
+            const members = await io
+                .in(roomId)
+                .fetchSockets();
 
             const duplicateRole = members.some((member) => {
 
@@ -239,7 +284,8 @@ io.on("connection", (socket) => {
             if (duplicateRole) {
 
                 socket.emit("join-error", {
-                    message: `A ${verifiedRole} is already connected to this room`
+                    message:
+                        `A ${verifiedRole} is already connected to this room`
                 });
 
                 return;
@@ -251,8 +297,10 @@ io.on("connection", (socket) => {
             if (previousRoom && previousRoom !== roomId) {
 
                 socket.to(previousRoom).emit("peer-status", {
+
                     status: "disconnected",
                     role: socket.data.role
+
                 });
 
                 await socket.leave(previousRoom);
@@ -270,25 +318,34 @@ io.on("connection", (socket) => {
 
             // Confirm joining.
             socket.emit("joined-room", {
+
                 roomId: roomId,
                 role: verifiedRole,
                 message: "Successfully joined relay room"
+
             });
 
             // Notify other phone.
             socket.to(roomId).emit("peer-status", {
+
                 status: "connected",
                 role: verifiedRole
+
             });
 
             // Get room members.
-            const roomMembers = await io.in(roomId).fetchSockets();
+            const roomMembers = await io
+                .in(roomId)
+                .fetchSockets();
 
             io.to(roomId).emit("room-status", {
+
                 roomId: roomId,
+
                 members: roomMembers.map((member) => ({
                     role: member.data.role
                 }))
+
             });
 
             console.log(
@@ -297,7 +354,10 @@ io.on("connection", (socket) => {
 
         } catch (error) {
 
-            console.error("[JOIN ERROR]", error.message);
+            console.error(
+                "[JOIN ERROR]",
+                error.message
+            );
 
             socket.emit("join-error", {
                 message: "Server could not join the room"
@@ -325,7 +385,9 @@ io.on("connection", (socket) => {
                 return;
             }
 
-            const message = String(data?.message || "").trim();
+            const message = String(
+                data?.message || ""
+            ).trim();
 
             if (!message) {
 
@@ -346,23 +408,33 @@ io.on("connection", (socket) => {
             }
 
             const messageData = {
+
                 sender: role,
                 message: message,
                 timestamp: new Date().toISOString()
+
             };
 
             // Forward message to other phone.
-            socket.to(roomId).emit("receive-message", messageData);
+            socket.to(roomId).emit(
+                "receive-message",
+                messageData
+            );
 
             // Confirm sender.
             socket.emit("message-sent", {
+
                 status: "success",
                 message: "Message forwarded to room"
+
             });
 
         } catch (error) {
 
-            console.error("[MESSAGE ERROR]", error.message);
+            console.error(
+                "[MESSAGE ERROR]",
+                error.message
+            );
 
             socket.emit("message-error", {
                 message: "Server failed to send message"
@@ -390,7 +462,10 @@ io.on("connection", (socket) => {
                 return;
             }
 
-            if (role !== "sender" && role !== "receiver") {
+            if (
+                role !== "sender" &&
+                role !== "receiver"
+            ) {
 
                 socket.emit("packet-error", {
                     message: "Invalid sender role"
@@ -408,7 +483,10 @@ io.on("connection", (socket) => {
                 return;
             }
 
-            if (packet.length < 20 || packet.length > 1500) {
+            if (
+                packet.length < 20 ||
+                packet.length > 1500
+            ) {
 
                 socket.emit("packet-error", {
                     message: "Invalid IP packet size"
@@ -419,8 +497,12 @@ io.on("connection", (socket) => {
 
             // Validate IPv4 packet.
             const version = packet[0] >> 4;
-            const headerLength = (packet[0] & 0x0F) * 4;
-            const totalLength = packet.readUInt16BE(2);
+
+            const headerLength =
+                (packet[0] & 0x0F) * 4;
+
+            const totalLength =
+                packet.readUInt16BE(2);
 
             if (
                 version !== 4 ||
@@ -438,11 +520,17 @@ io.on("connection", (socket) => {
             }
 
             // Forward packet to opposite peer.
-            socket.to(roomId).emit("ip-packet", packet);
+            socket.to(roomId).emit(
+                "ip-packet",
+                packet
+            );
 
         } catch (error) {
 
-            console.error("[PACKET RELAY ERROR]", error.message);
+            console.error(
+                "[PACKET RELAY ERROR]",
+                error.message
+            );
 
             socket.emit("packet-error", {
                 message: "Server failed to relay packet"
@@ -459,30 +547,42 @@ io.on("connection", (socket) => {
         const roomId = socket.data.roomId;
         const role = socket.data.role;
 
-        console.log("[DISCONNECTED]", reason);
+        console.log(
+            "[DISCONNECTED]",
+            reason
+        );
 
         if (roomId) {
 
             socket.to(roomId).emit("peer-status", {
+
                 status: "disconnected",
                 role: role
+
             });
 
             try {
 
-                const remainingMembers =
-                    await io.in(roomId).fetchSockets();
+                const remainingMembers = await io
+                    .in(roomId)
+                    .fetchSockets();
 
                 io.to(roomId).emit("room-status", {
+
                     roomId: roomId,
+
                     members: remainingMembers.map((member) => ({
                         role: member.data.role
                     }))
+
                 });
 
             } catch (error) {
 
-                console.error("[DISCONNECT ERROR]", error.message);
+                console.error(
+                    "[DISCONNECT ERROR]",
+                    error.message
+                );
             }
         }
     });
@@ -493,7 +593,10 @@ io.on("connection", (socket) => {
 
     socket.on("error", (error) => {
 
-        console.error("[SOCKET ERROR]", error.message);
+        console.error(
+            "[SOCKET ERROR]",
+            error.message
+        );
     });
 
 });
@@ -505,8 +608,10 @@ io.on("connection", (socket) => {
 io.engine.on("connection_error", (error) => {
 
     console.error("[ENGINE.IO ERROR]", {
+
         code: error.code,
         message: error.message
+
     });
 });
 
@@ -526,10 +631,15 @@ server.listen(PORT, HOST, () => {
 
     console.log(
         "Hosting :",
-        process.env.RENDER ? "RENDER CLOUD" : "LOCAL COMPUTER"
+        process.env.RENDER
+            ? "RENDER CLOUD"
+            : "LOCAL COMPUTER"
     );
 
-    console.log("Firebase: AUTHENTICATION ENABLED");
+    console.log(
+        "Firebase: AUTHENTICATION ENABLED"
+    );
+
     console.log("================================\n");
 });
 
@@ -539,7 +649,10 @@ server.listen(PORT, HOST, () => {
 
 server.on("error", (error) => {
 
-    console.error("[SERVER ERROR]", error.message);
+    console.error(
+        "[SERVER ERROR]",
+        error.message
+    );
 });
 
 // =====================================
@@ -548,13 +661,17 @@ server.on("error", (error) => {
 
 process.on("SIGTERM", () => {
 
-    console.log("SIGTERM received. Closing server...");
+    console.log(
+        "SIGTERM received. Closing server..."
+    );
 
     io.close(() => {
 
         server.close(() => {
 
-            console.log("RemoteNet server stopped.");
+            console.log(
+                "RemoteNet server stopped."
+            );
 
             process.exit(0);
         });
