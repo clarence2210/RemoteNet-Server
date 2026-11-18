@@ -3,20 +3,53 @@ const express = require("express");
 const http = require("http");
 const cors = require("cors");
 const { Server } = require("socket.io");
+const admin = require("firebase-admin");
+
+// =====================================
+// FIREBASE ADMIN INITIALIZATION
+// =====================================
+
+try {
+    const encodedServiceAccount =
+        process.env.FIREBASE_SERVICE_ACCOUNT_BASE64;
+
+    if (!encodedServiceAccount) {
+        throw new Error("Firebase service account environment variable is missing");
+    }
+
+    const serviceAccount = JSON.parse(
+        Buffer.from(encodedServiceAccount, "base64").toString("utf8")
+    );
+
+    admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount),
+        databaseURL:
+            "https://remotenet-b4106-default-rtdb.asia-southeast1.firebasedatabase.app"
+    });
+
+    console.log("[FIREBASE] Admin SDK initialized successfully");
+
+} catch (error) {
+    console.error("[FIREBASE] Initialization failed:", error.message);
+    process.exit(1);
+}
+
+const firebaseAuth = admin.auth();
+const firebaseDb = admin.database();
+
+// =====================================
+// SERVER SETUP
+// =====================================
 
 const app = express();
 const server = http.createServer(app);
 
-// Render provides PORT automatically.
-// Local testing uses port 3000.
 const PORT = process.env.PORT || 3000;
 const HOST = "0.0.0.0";
 
-// Middleware
 app.use(cors());
 app.use(express.json());
 
-// Socket.IO configuration
 const io = new Server(server, {
     cors: {
         origin: "*",
@@ -57,16 +90,56 @@ app.get("/health", (req, res) => {
 });
 
 // =====================================
+// FIREBASE SOCKET AUTHENTICATION
+// =====================================
+
+io.use(async (socket, next) => {
+
+    try {
+
+        const authorization =
+            socket.handshake.headers.authorization || "";
+
+        if (!authorization.startsWith("Bearer ")) {
+            return next(new Error("Authentication required"));
+        }
+
+        const idToken = authorization.substring(7).trim();
+
+        if (!idToken) {
+            return next(new Error("Authentication token missing"));
+        }
+
+        // Verify Firebase ID token and check revocation.
+        const decodedToken = await firebaseAuth.verifyIdToken(
+            idToken,
+            true
+        );
+
+        if (!decodedToken.uid) {
+            return next(new Error("Invalid authentication identity"));
+        }
+
+        // Store verified identity on the socket.
+        socket.data.uid = decodedToken.uid;
+
+        next();
+
+    } catch (error) {
+
+        console.warn("[AUTH] Socket authentication rejected");
+
+        next(new Error("Firebase authentication failed"));
+    }
+});
+
+// =====================================
 // SOCKET.IO CONNECTION
 // =====================================
 
 io.on("connection", (socket) => {
 
-    console.log("\n------------------------------");
-    console.log("NEW CLIENT CONNECTED");
-    console.log("Socket ID:", socket.id);
-    console.log("Transport:", socket.conn.transport.name);
-    console.log("------------------------------");
+    console.log("[CONNECT] Authenticated client connected");
 
     // =================================
     // JOIN ROOM
@@ -78,12 +151,11 @@ io.on("connection", (socket) => {
 
             const roomId = String(data?.roomId || "").trim();
 
-            const role = String(data?.role || "")
-                .trim()
-                .toLowerCase();
+            // Client-supplied role is deliberately ignored.
+            const uid = socket.data.uid;
 
-            // Validate room code
-            if (!/^[0-9]{6}$/.test(roomId)) {
+            // Validate room code.
+            if (!/^[1-9][0-9]{5}$/.test(roomId)) {
 
                 socket.emit("join-error", {
                     message: "Invalid room code"
@@ -92,74 +164,122 @@ io.on("connection", (socket) => {
                 return;
             }
 
-            // Validate role
-            if (role !== "sender" && role !== "receiver") {
+            if (!uid) {
 
                 socket.emit("join-error", {
-                    message: "Invalid role"
+                    message: "Authentication required"
                 });
 
                 return;
             }
 
-            // Leave previous room
-            const previousRoom = socket.data.roomId;
+            // Read authoritative room information from Firebase.
+            const snapshot = await firebaseDb
+                .ref(`sessions/${roomId}`)
+                .get();
 
-            if (previousRoom) {
+            if (!snapshot.exists()) {
 
-                socket.to(previousRoom).emit("peer-status", {
-                    status: "disconnected"
+                socket.emit("join-error", {
+                    message: "Room does not exist"
                 });
 
-                await socket.leave(previousRoom);
-
-                socket.data.roomId = null;
-                socket.data.role = null;
+                return;
             }
 
-            // Check duplicate role
+            const session = snapshot.val();
+
+            // Room must already be connected in Firebase.
+            if (
+                !session ||
+                session.status !== "connected" ||
+                typeof session.senderUid !== "string" ||
+                typeof session.receiverUid !== "string" ||
+                !session.senderUid ||
+                !session.receiverUid
+            ) {
+
+                socket.emit("join-error", {
+                    message: "Room is not ready"
+                });
+
+                return;
+            }
+
+            // Determine role using verified Firebase UID.
+            let verifiedRole = null;
+
+            if (uid === session.senderUid) {
+                verifiedRole = "sender";
+            } else if (uid === session.receiverUid) {
+                verifiedRole = "receiver";
+            }
+
+            if (!verifiedRole) {
+
+                socket.emit("join-error", {
+                    message: "You are not authorized to join this room"
+                });
+
+                return;
+            }
+
+            // Check duplicate role BEFORE leaving previous room.
             const members = await io.in(roomId).fetchSockets();
 
             const duplicateRole = members.some((member) => {
 
                 return member.id !== socket.id &&
-                    member.data.role === role;
+                    member.data.role === verifiedRole;
 
             });
 
             if (duplicateRole) {
 
                 socket.emit("join-error", {
-                    message: `A ${role} is already connected to this room`
+                    message: `A ${verifiedRole} is already connected to this room`
                 });
 
                 return;
             }
 
-            // Join room
+            // Leave previous room only after authorization succeeds.
+            const previousRoom = socket.data.roomId;
+
+            if (previousRoom && previousRoom !== roomId) {
+
+                socket.to(previousRoom).emit("peer-status", {
+                    status: "disconnected",
+                    role: socket.data.role
+                });
+
+                await socket.leave(previousRoom);
+            }
+
+            // Join authorized room.
             await socket.join(roomId);
 
             socket.data.roomId = roomId;
-            socket.data.role = role;
+            socket.data.role = verifiedRole;
 
             console.log(
-                `[JOIN] ${role.toUpperCase()} joined room ${roomId}`
+                `[JOIN] Authorized ${verifiedRole.toUpperCase()} joined a room`
             );
 
-            // Confirm joining
+            // Confirm joining.
             socket.emit("joined-room", {
                 roomId: roomId,
-                role: role,
+                role: verifiedRole,
                 message: "Successfully joined relay room"
             });
 
-            // Notify other phone
+            // Notify other phone.
             socket.to(roomId).emit("peer-status", {
                 status: "connected",
-                role: role
+                role: verifiedRole
             });
 
-            // Get room members
+            // Get room members.
             const roomMembers = await io.in(roomId).fetchSockets();
 
             io.to(roomId).emit("room-status", {
@@ -170,19 +290,17 @@ io.on("connection", (socket) => {
             });
 
             console.log(
-                `[ROOM] ${roomId} has ${roomMembers.length} client(s)`
+                `[ROOM] Authorized members: ${roomMembers.length}`
             );
 
         } catch (error) {
 
-            console.error("[JOIN ERROR]", error);
+            console.error("[JOIN ERROR]", error.message);
 
             socket.emit("join-error", {
                 message: "Server could not join the room"
             });
-
         }
-
     });
 
     // =================================
@@ -231,14 +349,10 @@ io.on("connection", (socket) => {
                 timestamp: new Date().toISOString()
             };
 
-            console.log(
-                `[MESSAGE] ${role.toUpperCase()} -> Room ${roomId}: ${message}`
-            );
-
-            // Forward message to other phone
+            // Forward message to other phone.
             socket.to(roomId).emit("receive-message", messageData);
 
-            // Confirm sender
+            // Confirm sender.
             socket.emit("message-sent", {
                 status: "success",
                 message: "Message forwarded to room"
@@ -246,14 +360,12 @@ io.on("connection", (socket) => {
 
         } catch (error) {
 
-            console.error("[MESSAGE ERROR]", error);
+            console.error("[MESSAGE ERROR]", error.message);
 
             socket.emit("message-error", {
                 message: "Server failed to send message"
             });
-
         }
-
     });
 
     // =================================
@@ -267,7 +379,6 @@ io.on("connection", (socket) => {
             const roomId = socket.data.roomId;
             const role = socket.data.role;
 
-            // Verify room membership
             if (!roomId || !role) {
 
                 socket.emit("packet-error", {
@@ -277,7 +388,6 @@ io.on("connection", (socket) => {
                 return;
             }
 
-            // Validate role
             if (role !== "sender" && role !== "receiver") {
 
                 socket.emit("packet-error", {
@@ -287,7 +397,6 @@ io.on("connection", (socket) => {
                 return;
             }
 
-            // Accept only binary Buffer packets
             if (!Buffer.isBuffer(packet)) {
 
                 socket.emit("packet-error", {
@@ -297,7 +406,6 @@ io.on("connection", (socket) => {
                 return;
             }
 
-            // Current RemoteNet VPN MTU is 1500 bytes
             if (packet.length < 20 || packet.length > 1500) {
 
                 socket.emit("packet-error", {
@@ -307,7 +415,7 @@ io.on("connection", (socket) => {
                 return;
             }
 
-            // Validate IPv4 packet
+            // Validate IPv4 packet.
             const version = packet[0] >> 4;
             const headerLength = (packet[0] & 0x0F) * 4;
             const totalLength = packet.readUInt16BE(2);
@@ -315,6 +423,7 @@ io.on("connection", (socket) => {
             if (
                 version !== 4 ||
                 headerLength < 20 ||
+                headerLength > packet.length ||
                 totalLength < headerLength ||
                 totalLength !== packet.length
             ) {
@@ -326,19 +435,17 @@ io.on("connection", (socket) => {
                 return;
             }
 
-            // Forward binary packet to the opposite peer
+            // Forward packet to opposite peer.
             socket.to(roomId).emit("ip-packet", packet);
 
         } catch (error) {
 
-            console.error("[PACKET RELAY ERROR]", error);
+            console.error("[PACKET RELAY ERROR]", error.message);
 
             socket.emit("packet-error", {
                 message: "Server failed to relay packet"
             });
-
         }
-
     });
 
     // =================================
@@ -350,9 +457,7 @@ io.on("connection", (socket) => {
         const roomId = socket.data.roomId;
         const role = socket.data.role;
 
-        console.log(
-            `[DISCONNECTED] ${socket.id} | Reason: ${reason}`
-        );
+        console.log("[DISCONNECTED]", reason);
 
         if (roomId) {
 
@@ -375,12 +480,9 @@ io.on("connection", (socket) => {
 
             } catch (error) {
 
-                console.error("[DISCONNECT ERROR]", error);
-
+                console.error("[DISCONNECT ERROR]", error.message);
             }
-
         }
-
     });
 
     // =================================
@@ -389,8 +491,7 @@ io.on("connection", (socket) => {
 
     socket.on("error", (error) => {
 
-        console.error("[SOCKET ERROR]", error);
-
+        console.error("[SOCKET ERROR]", error.message);
     });
 
 });
@@ -401,12 +502,10 @@ io.on("connection", (socket) => {
 
 io.engine.on("connection_error", (error) => {
 
-    console.error("\n[ENGINE.IO CONNECTION ERROR]");
-
-    console.error("Code:", error.code);
-    console.error("Message:", error.message);
-    console.error("Context:", error.context);
-
+    console.error("[ENGINE.IO ERROR]", {
+        code: error.code,
+        message: error.message
+    });
 });
 
 // =====================================
@@ -428,8 +527,8 @@ server.listen(PORT, HOST, () => {
         process.env.RENDER ? "RENDER CLOUD" : "LOCAL COMPUTER"
     );
 
+    console.log("Firebase: AUTHENTICATION ENABLED");
     console.log("================================\n");
-
 });
 
 // =====================================
@@ -438,8 +537,7 @@ server.listen(PORT, HOST, () => {
 
 server.on("error", (error) => {
 
-    console.error("[SERVER ERROR]", error);
-
+    console.error("[SERVER ERROR]", error.message);
 });
 
 // =====================================
@@ -457,9 +555,6 @@ process.on("SIGTERM", () => {
             console.log("RemoteNet server stopped.");
 
             process.exit(0);
-
         });
-
     });
-
 });
