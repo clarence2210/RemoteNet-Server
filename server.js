@@ -1,3 +1,4 @@
+
 const express = require("express");
 const http = require("http");
 const cors = require("cors");
@@ -249,6 +250,91 @@ io.on("connection", (socket) => {
 
             socket.emit("message-error", {
                 message: "Server failed to send message"
+            });
+
+        }
+
+    });
+
+    // =================================
+    // BINARY IP PACKET RELAY
+    // =================================
+
+    socket.on("ip-packet", (packet) => {
+
+        try {
+
+            const roomId = socket.data.roomId;
+            const role = socket.data.role;
+
+            // Verify room membership
+            if (!roomId || !role) {
+
+                socket.emit("packet-error", {
+                    message: "Join a room before sending packets"
+                });
+
+                return;
+            }
+
+            // Validate role
+            if (role !== "sender" && role !== "receiver") {
+
+                socket.emit("packet-error", {
+                    message: "Invalid sender role"
+                });
+
+                return;
+            }
+
+            // Accept only binary Buffer packets
+            if (!Buffer.isBuffer(packet)) {
+
+                socket.emit("packet-error", {
+                    message: "Invalid packet format"
+                });
+
+                return;
+            }
+
+            // Current RemoteNet VPN MTU is 1500 bytes
+            if (packet.length < 20 || packet.length > 1500) {
+
+                socket.emit("packet-error", {
+                    message: "Invalid IP packet size"
+                });
+
+                return;
+            }
+
+            // Validate IPv4 packet
+            const version = packet[0] >> 4;
+            const headerLength = (packet[0] & 0x0F) * 4;
+            const totalLength = packet.readUInt16BE(2);
+
+            if (
+                version !== 4 ||
+                headerLength < 20 ||
+                totalLength < headerLength ||
+                totalLength !== packet.length
+            ) {
+
+                socket.emit("packet-error", {
+                    message: "Invalid IPv4 packet"
+                });
+
+                return;
+            }
+
+            // Forward binary packet to the opposite peer
+            socket.to(roomId).emit("ip-packet", packet);
+
+        } catch (error) {
+
+            console.error("[PACKET RELAY ERROR]", error);
+
+            socket.emit("packet-error", {
+                message: "Server failed to relay packet"
             });
 
         }
